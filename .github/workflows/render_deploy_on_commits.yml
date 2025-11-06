@@ -1,4 +1,4 @@
-name: Build and Push Docker Image (Every X Commits)
+name: Build and Push Docker Image (After X Commits)
 
 on:
   push:
@@ -16,12 +16,13 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   COMMIT_THRESHOLD: 2
+  BUILD_TAG_PREFIX: render
 
 jobs:
-  check-and-build:
+  build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
 
     steps:
@@ -30,28 +31,63 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history to count commits
 
-      - name: Get last build tag
-        id: get_last_tag
+      - name: Get last Docker image build time
+        id: get_last_build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Look for the last build tag (format: build-YYYYMMDD-HHMMSS)
-          LAST_TAG=$(git tag -l "build-*" | sort -r | head -n 1)
+          # Query GitHub Container Registry for the last image with our specific tag pattern
+          PACKAGE_NAME=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f2)
+          ORG_OR_USER=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f1)
+          PREFIX="${{ env.BUILD_TAG_PREFIX }}"
 
-          if [ -z "$LAST_TAG" ]; then
-            echo "No previous build tag found. Creating initial tag."
-            echo "last_tag=" >> $GITHUB_OUTPUT
+          # Try to get package versions from GHCR API
+          echo "Querying container registry for last $PREFIX build..."
+
+          # Get all tags for the package
+          RESPONSE=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/users/$ORG_OR_USER/packages/container/$PACKAGE_NAME/versions" \
+            --paginate 2>/dev/null || echo "[]")
+
+          if [ "$RESPONSE" = "[]" ] || [ -z "$RESPONSE" ]; then
+            echo "No previous Docker images found. This will be the first build."
             echo "commits_since_last=999" >> $GITHUB_OUTPUT
+            echo "last_build_time=never" >> $GITHUB_OUTPUT
+            echo "last_build_tag=none" >> $GITHUB_OUTPUT
           else
-            echo "Last build tag: $LAST_TAG"
-            COMMITS_SINCE=$(git rev-list ${LAST_TAG}..HEAD --count)
-            echo "Commits since last build: $COMMITS_SINCE"
-            echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
-            echo "commits_since_last=$COMMITS_SINCE" >> $GITHUB_OUTPUT
+            # Get the most recent tag matching our pattern (format: PREFIX-YYYYMMDD-HHmmss)
+            LAST_BUILD_TAG=$(echo "$RESPONSE" | jq -r '.[].metadata.container.tags[]? // empty' | grep -E "^${PREFIX}-[0-9]{8}-[0-9]{6}$" | sort -r | head -n 1)
+            
+            if [ -z "$LAST_BUILD_TAG" ]; then
+              echo "No $PREFIX timestamp tags found. This will be the first tracked build."
+              echo "commits_since_last=999" >> $GITHUB_OUTPUT
+              echo "last_build_time=never" >> $GITHUB_OUTPUT
+              echo "last_build_tag=none" >> $GITHUB_OUTPUT
+            else
+              echo "Last build tag: $LAST_BUILD_TAG"
+              
+              # Extract timestamp from tag (remove prefix)
+              LAST_BUILD_TIME=$(echo "$LAST_BUILD_TAG" | sed "s/^${PREFIX}-//")
+              
+              # Convert timestamp to a date format git understands (YYYY-MM-DD HH:MM:SS)
+              BUILD_DATE=$(echo "$LAST_BUILD_TIME" | sed -E 's/([0-9]{4})([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})([0-9]{2})/\1-\2-\3 \4:\5:\6/')
+              
+              # Count commits since that timestamp
+              COMMITS_SINCE=$(git rev-list --count --since="$BUILD_DATE" HEAD)
+              
+              echo "Commits since last build ($BUILD_DATE): $COMMITS_SINCE"
+              echo "commits_since_last=$COMMITS_SINCE" >> $GITHUB_OUTPUT
+              echo "last_build_time=$LAST_BUILD_TIME" >> $GITHUB_OUTPUT
+              echo "last_build_tag=$LAST_BUILD_TAG" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Determine if build should proceed
         id: should_build
         run: |
-          COMMITS=${{ steps.get_last_tag.outputs.commits_since_last }}
+          COMMITS=${{ steps.get_last_build.outputs.commits_since_last }}
           FORCE=${{ github.event.inputs.force_build }}
 
           if [ "$FORCE" = "true" ]; then
@@ -73,6 +109,7 @@ jobs:
           echo "### Build Decision" >> $GITHUB_STEP_SUMMARY
           echo "**Should Build:** ${{ steps.should_build.outputs.build }}" >> $GITHUB_STEP_SUMMARY
           echo "**Reason:** ${{ steps.should_build.outputs.reason }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Last Build Tag:** ${{ steps.get_last_build.outputs.last_build_tag }}" >> $GITHUB_STEP_SUMMARY
 
       - name: Set up QEMU
         if: steps.should_build.outputs.build == 'true'
@@ -97,9 +134,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
-            type=sha
-            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
+            type=raw,value=${{ env.BUILD_TAG_PREFIX }}-latest
+            type=sha,prefix=${{ env.BUILD_TAG_PREFIX }}-
+            type=raw,value=${{ env.BUILD_TAG_PREFIX }}-{{date 'YYYYMMDD-HHmmss'}}
 
       - name: Build and push Docker image
         if: steps.should_build.outputs.build == 'true'
@@ -109,22 +146,25 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: linux/amd64 # Build only amd64 for speed (remove arm64)
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BUILD_TAG_PREFIX }}-buildcache
+            type=gha
+          cache-to: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BUILD_TAG_PREFIX }}-buildcache,mode=max
+            type=gha,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
 
-      - name: Create build tag
+      - name: Build summary
         if: steps.should_build.outputs.build == 'true'
         run: |
-          BUILD_TAG="build-$(date +%Y%m%d-%H%M%S)"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$BUILD_TAG" -m "Build after ${{ steps.get_last_tag.outputs.commits_since_last }} commits"
-          git push origin "$BUILD_TAG"
-
-          echo "### Build Tag Created" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag:** $BUILD_TAG" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Docker Image Built and Pushed" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag Prefix:** ${{ env.BUILD_TAG_PREFIX }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags Created:** ${{ env.BUILD_TAG_PREFIX }}-latest, ${{ env.BUILD_TAG_PREFIX }}-sha-${GITHUB_SHA:0:7}, ${{ env.BUILD_TAG_PREFIX }}-YYYYMMDD-HHmmss" >> $GITHUB_STEP_SUMMARY
+          echo "**Commits in this build:** ${{ steps.get_last_build.outputs.commits_since_last }}" >> $GITHUB_STEP_SUMMARY
 
       - name: Skip build notification
         if: steps.should_build.outputs.build != 'true'
