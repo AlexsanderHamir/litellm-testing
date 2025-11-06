@@ -13,8 +13,8 @@ on:
         default: false
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  REGISTRY: docker.io
+  IMAGE_NAME: alexsanderperf/litellm # Change 'your-dockerhub-username' to your actual Docker Hub username
   COMMIT_THRESHOLD: 2
   BUILD_TAG_PREFIX: render
 
@@ -33,32 +33,25 @@ jobs:
 
       - name: Get last Docker image build time
         id: get_last_build
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Query GitHub Container Registry for the last image with our specific tag pattern
-          PACKAGE_NAME=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')
-          ORG_OR_USER=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f1 | tr '[:upper:]' '[:lower:]')
+          # Query Docker Hub for the last image with our specific tag pattern
+          IMAGE_NAME_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
           PREFIX="${{ env.BUILD_TAG_PREFIX }}"
 
-          # Try to get package versions from GHCR API
-          echo "Querying container registry for last $PREFIX build..."
+          echo "Querying Docker Hub for last $PREFIX build..."
 
-          # Get all tags for the package
-          RESPONSE=$(gh api \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/users/$ORG_OR_USER/packages/container/$PACKAGE_NAME/versions" \
-            --paginate 2>/dev/null || echo "[]")
+          # Get all tags for the Docker Hub repository
+          RESPONSE=$(curl -s "https://hub.docker.com/v2/repositories/${IMAGE_NAME_LOWER}/tags?page_size=100" || echo '{"results":[]}')
 
-          if [ "$RESPONSE" = "[]" ] || [ -z "$RESPONSE" ]; then
+          # Check if the repository exists and has tags
+          if [ "$(echo "$RESPONSE" | jq -r '.results | length')" = "0" ]; then
             echo "No previous Docker images found. This will be the first build."
             echo "commits_since_last=999" >> $GITHUB_OUTPUT
             echo "last_build_time=never" >> $GITHUB_OUTPUT
             echo "last_build_tag=none" >> $GITHUB_OUTPUT
           else
             # Get the most recent tag matching our pattern (format: PREFIX-YYYYMMDD-HHmmss)
-            LAST_BUILD_TAG=$(echo "$RESPONSE" | jq -r '.[].metadata.container.tags[]? // empty' | grep -E "^${PREFIX}-[0-9]{8}-[0-9]{6}$" | sort -r | head -n 1)
+            LAST_BUILD_TAG=$(echo "$RESPONSE" | jq -r '.results[].name' | grep -E "^${PREFIX}-[0-9]{8}-[0-9]{6}$" | sort -r | head -n 1)
             
             if [ -z "$LAST_BUILD_TAG" ]; then
               echo "No $PREFIX timestamp tags found. This will be the first tracked build."
@@ -119,13 +112,12 @@ jobs:
         if: steps.should_build.outputs.build == 'true'
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to the Container registry
+      - name: Log in to Docker Hub
         if: steps.should_build.outputs.build == 'true'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Lowercase image name
         if: steps.should_build.outputs.build == 'true'
