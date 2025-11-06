@@ -1,0 +1,166 @@
+name: Build, Push and Deploy to Render (Every 50 Commits)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: "Force deployment regardless of commit count"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  COMMIT_THRESHOLD: 2
+
+jobs:
+  check-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history to count commits
+
+      - name: Get last deployment tag
+        id: get_last_tag
+        run: |
+          # Look for the last deployment tag (format: deploy-YYYYMMDD-HHMMSS)
+          LAST_TAG=$(git tag -l "deploy-*" | sort -r | head -n 1)
+
+          if [ -z "$LAST_TAG" ]; then
+            echo "No previous deployment tag found. Creating initial tag."
+            echo "last_tag=" >> $GITHUB_OUTPUT
+            echo "commits_since_last=999" >> $GITHUB_OUTPUT
+          else
+            echo "Last deployment tag: $LAST_TAG"
+            COMMITS_SINCE=$(git rev-list ${LAST_TAG}..HEAD --count)
+            echo "Commits since last deployment: $COMMITS_SINCE"
+            echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+            echo "commits_since_last=$COMMITS_SINCE" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine if deployment should proceed
+        id: should_deploy
+        run: |
+          COMMITS=${{ steps.get_last_tag.outputs.commits_since_last }}
+          FORCE=${{ github.event.inputs.force_deploy }}
+
+          if [ "$FORCE" = "true" ]; then
+            echo "Force deployment requested"
+            echo "deploy=true" >> $GITHUB_OUTPUT
+            echo "reason=Force deployment requested" >> $GITHUB_OUTPUT
+          elif [ "$COMMITS" -ge "${{ env.COMMIT_THRESHOLD }}" ]; then
+            echo "Commit threshold reached: $COMMITS commits"
+            echo "deploy=true" >> $GITHUB_OUTPUT
+            echo "reason=$COMMITS commits since last deployment (threshold: ${{ env.COMMIT_THRESHOLD }})" >> $GITHUB_OUTPUT
+          else
+            echo "Not enough commits: $COMMITS/${{ env.COMMIT_THRESHOLD }}"
+            echo "deploy=false" >> $GITHUB_OUTPUT
+            echo "reason=Only $COMMITS commits since last deployment (threshold: ${{ env.COMMIT_THRESHOLD }})" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Display deployment decision
+        run: |
+          echo "### Deployment Decision" >> $GITHUB_STEP_SUMMARY
+          echo "**Should Deploy:** ${{ steps.should_deploy.outputs.deploy }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Reason:** ${{ steps.should_deploy.outputs.reason }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Set up QEMU
+        if: steps.should_deploy.outputs.deploy == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.should_deploy.outputs.deploy == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        if: steps.should_deploy.outputs.deploy == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        if: steps.should_deploy.outputs.deploy == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=render-latest
+            type=sha,prefix=render-
+            type=raw,value=render-{{date 'YYYYMMDD-HHmmss'}}
+
+      - name: Build and push Docker image
+        if: steps.should_deploy.outputs.deploy == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:render-latest
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create deployment tag
+        if: steps.should_deploy.outputs.deploy == 'true'
+        run: |
+          DEPLOY_TAG="deploy-$(date +%Y%m%d-%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$DEPLOY_TAG" -m "Deployment after ${{ steps.get_last_tag.outputs.commits_since_last }} commits"
+          git push origin "$DEPLOY_TAG"
+
+          echo "### Deployment Tag Created" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** $DEPLOY_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:render-latest" >> $GITHUB_STEP_SUMMARY
+
+      - name: Trigger Render deployment
+        if: steps.should_deploy.outputs.deploy == 'true'
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK_URL }}" ]; then
+            echo "⚠️ RENDER_DEPLOY_HOOK_URL secret not set. Skipping Render deployment trigger."
+            echo "### ⚠️ Render Deployment Skipped" >> $GITHUB_STEP_SUMMARY
+            echo "The RENDER_DEPLOY_HOOK_URL secret is not configured." >> $GITHUB_STEP_SUMMARY
+            echo "To enable automatic deployments:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Go to your Render dashboard" >> $GITHUB_STEP_SUMMARY
+            echo "2. Navigate to your service settings" >> $GITHUB_STEP_SUMMARY
+            echo "3. Copy the Deploy Hook URL" >> $GITHUB_STEP_SUMMARY
+            echo "4. Add it as a GitHub secret named RENDER_DEPLOY_HOOK_URL" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Triggering Render deployment..."
+            response=$(curl -s -w "\n%{http_code}" -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}")
+            http_code=$(echo "$response" | tail -n1)
+            
+            if [ "$http_code" -eq 200 ] || [ "$http_code" -eq 201 ]; then
+              echo "✅ Render deployment triggered successfully!"
+              echo "### ✅ Render Deployment Triggered" >> $GITHUB_STEP_SUMMARY
+              echo "**Status:** Success (HTTP $http_code)" >> $GITHUB_STEP_SUMMARY
+              echo "**Image:** ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:render-latest" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Failed to trigger Render deployment (HTTP $http_code)"
+              echo "Response: $(echo "$response" | head -n-1)"
+              echo "### ❌ Render Deployment Failed" >> $GITHUB_STEP_SUMMARY
+              echo "**Status:** Failed (HTTP $http_code)" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+          fi
+
+      - name: Skip deployment notification
+        if: steps.should_deploy.outputs.deploy != 'true'
+        run: |
+          echo "### ℹ️ Deployment Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.should_deploy.outputs.reason }}" >> $GITHUB_STEP_SUMMARY
