@@ -37,8 +37,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Query GitHub Container Registry for the last image with our specific tag pattern
-          PACKAGE_NAME=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f2)
-          ORG_OR_USER=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f1)
+          PACKAGE_NAME=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]')
+          ORG_OR_USER=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f1 | tr '[:upper:]' '[:lower:]')
           PREFIX="${{ env.BUILD_TAG_PREFIX }}"
 
           # Try to get package versions from GHCR API
@@ -127,12 +127,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Lowercase image name
+        if: steps.should_build.outputs.build == 'true'
+        id: lowercase
+        run: |
+          echo "image_name=$(echo ${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
       - name: Extract metadata (tags, labels) for Docker
         if: steps.should_build.outputs.build == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ steps.lowercase.outputs.image_name }}
           tags: |
             type=raw,value=${{ env.BUILD_TAG_PREFIX }}-latest
             type=sha,prefix=${{ env.BUILD_TAG_PREFIX }}-
@@ -148,10 +154,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64 # Build only amd64 for speed (remove arm64)
           cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BUILD_TAG_PREFIX }}-buildcache
+            type=registry,ref=${{ env.REGISTRY }}/${{ steps.lowercase.outputs.image_name }}:${{ env.BUILD_TAG_PREFIX }}-buildcache
             type=gha
           cache-to: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BUILD_TAG_PREFIX }}-buildcache,mode=max
+            type=registry,ref=${{ env.REGISTRY }}/${{ steps.lowercase.outputs.image_name }}:${{ env.BUILD_TAG_PREFIX }}-buildcache,mode=max
             type=gha,mode=max
           build-args: |
             BUILDKIT_INLINE_CACHE=1
@@ -161,7 +167,7 @@ jobs:
         run: |
           echo "### ✅ Docker Image Built and Pushed" >> $GITHUB_STEP_SUMMARY
           echo "**Registry:** ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ steps.lowercase.outputs.image_name }}" >> $GITHUB_STEP_SUMMARY
           echo "**Tag Prefix:** ${{ env.BUILD_TAG_PREFIX }}" >> $GITHUB_STEP_SUMMARY
           echo "**Tags Created:** ${{ env.BUILD_TAG_PREFIX }}-latest, ${{ env.BUILD_TAG_PREFIX }}-sha-${GITHUB_SHA:0:7}, ${{ env.BUILD_TAG_PREFIX }}-YYYYMMDD-HHmmss" >> $GITHUB_STEP_SUMMARY
           echo "**Commits in this build:** ${{ steps.get_last_build.outputs.commits_since_last }}" >> $GITHUB_STEP_SUMMARY
