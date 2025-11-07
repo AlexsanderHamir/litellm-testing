@@ -41,12 +41,18 @@ jobs:
           fi
 
           echo "Fetching Render services to verify credentials..."
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
+          RESPONSE=$(curl -sS --max-time 30 -w "\n%{http_code}" \
             -H "Authorization: Bearer $RENDER_API_KEY" \
             https://api.render.com/v1/services)
 
           BODY=$(echo "$RESPONSE" | head -n -1)
           STATUS=$(echo "$RESPONSE" | tail -n 1)
+
+          if [ -z "$STATUS" ]; then
+            echo "No status code received from Render. Raw response:" >&2
+            echo "$RESPONSE" >&2
+            exit 1
+          fi
 
           if [ "$STATUS" != "200" ]; then
             echo "Failed to fetch services from Render (status: $STATUS). Response:" >&2
