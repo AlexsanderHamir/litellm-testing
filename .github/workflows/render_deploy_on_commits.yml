@@ -31,57 +31,6 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history to count commits
 
-      - name: List Render services (optional)
-        env:
-          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
-        run: |
-          if [ -z "$RENDER_API_KEY" ]; then
-            echo "RENDER_API_KEY not set; skipping Render service listing."
-            exit 0
-          fi
-
-          echo "Fetching Render services to verify credentials..."
-          RESPONSE=$(curl -sS --max-time 30 -w "\n%{http_code}" \
-            -H "Authorization: Bearer $RENDER_API_KEY" \
-            https://api.render.com/v1/services)
-
-          BODY=$(echo "$RESPONSE" | head -n -1)
-          STATUS=$(echo "$RESPONSE" | tail -n 1)
-
-          if [ -z "$STATUS" ]; then
-            echo "No status code received from Render. Raw response:" >&2
-            echo "$RESPONSE" >&2
-            exit 1
-          fi
-
-          if [ "$STATUS" != "200" ]; then
-            echo "Failed to fetch services from Render (status: $STATUS). Response:" >&2
-            echo "$BODY" >&2
-            exit 1
-          fi
-
-          echo "Successfully retrieved Render services:" >> $GITHUB_STEP_SUMMARY
-
-          if command -v jq >/dev/null 2>&1; then
-            if echo "$BODY" | jq empty >/dev/null 2>&1; then
-              SERVICE_SUMMARY=$(echo "$BODY" | jq '{
-                count: (if type == "array" then length else ((.["items"] // []) | length) end),
-                serviceNames: (if type == "array" then map((.name // ((.service? | .name) // .id // "unknown"))) else ((.["items"] // []) | map((.name // ((.service? | .name) // .id // "unknown")))) end)
-              }')
-              echo '```json' >> $GITHUB_STEP_SUMMARY
-              echo "$SERVICE_SUMMARY" >> $GITHUB_STEP_SUMMARY
-              echo '```' >> $GITHUB_STEP_SUMMARY
-            else
-              echo "```" >> $GITHUB_STEP_SUMMARY
-              echo "Received non-JSON response from Render." >> $GITHUB_STEP_SUMMARY
-              echo "```" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "$BODY" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          fi
-
       - name: Get last Docker image build time
         id: get_last_build
         run: |
@@ -204,6 +153,18 @@ jobs:
             type=gha,mode=max
           build-args: |
             BUILDKIT_INLINE_CACHE=1
+
+      - name: Trigger Render deploy
+        if: steps.should_build.outputs.build == 'true'
+        env:
+          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "RENDER_DEPLOY_HOOK secret not set; skipping deploy trigger."
+            exit 0
+          fi
+          echo "Triggering Render deploy hook..."
+          curl -fsS -X POST "$DEPLOY_HOOK"
 
       - name: Build summary
         if: steps.should_build.outputs.build == 'true'
