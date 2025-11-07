@@ -61,9 +61,26 @@ jobs:
           fi
 
           echo "Successfully retrieved Render services:" >> $GITHUB_STEP_SUMMARY
-          echo '```json' >> $GITHUB_STEP_SUMMARY
-          echo "$BODY" | jq '{count: length, serviceNames: [.[]?.service.name]}' >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          if command -v jq >/dev/null 2>&1; then
+            if echo "$BODY" | jq empty >/dev/null 2>&1; then
+              SERVICE_SUMMARY=$(echo "$BODY" | jq '{
+                count: (if type == "array" then length else ((.["items"] // []) | length) end),
+                serviceNames: (if type == "array" then map((.name // ((.service? | .name) // .id // "unknown"))) else ((.["items"] // []) | map((.name // ((.service? | .name) // .id // "unknown")))) end)
+              }')
+              echo '```json' >> $GITHUB_STEP_SUMMARY
+              echo "$SERVICE_SUMMARY" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            else
+              echo "```" >> $GITHUB_STEP_SUMMARY
+              echo "Received non-JSON response from Render." >> $GITHUB_STEP_SUMMARY
+              echo "```" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "$BODY" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Get last Docker image build time
         id: get_last_build
