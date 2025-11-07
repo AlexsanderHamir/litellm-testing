@@ -31,6 +31,34 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history to count commits
 
+      - name: List Render services (optional)
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          if [ -z "$RENDER_API_KEY" ]; then
+            echo "RENDER_API_KEY not set; skipping Render service listing."
+            exit 0
+          fi
+
+          echo "Fetching Render services to verify credentials..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            https://api.render.com/v1/services)
+
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          STATUS=$(echo "$RESPONSE" | tail -n 1)
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Failed to fetch services from Render (status: $STATUS). Response:" >&2
+            echo "$BODY" >&2
+            exit 1
+          fi
+
+          echo "Successfully retrieved Render services:" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          echo "$BODY" | jq '{count: length, serviceNames: [.[]?.service.name]}' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
       - name: Get last Docker image build time
         id: get_last_build
         run: |
