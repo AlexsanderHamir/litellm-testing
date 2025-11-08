@@ -14,7 +14,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: litellmperformancetesting/litellm # Change 'your-dockerhub-username' to your actual Docker Hub username
+  IMAGE_NAME: litellmperformancetesting/litellm # Change to your Docker Hub username
   COMMIT_THRESHOLD: 1
   BUILD_TAG_PREFIX: render
 
@@ -34,25 +34,18 @@ jobs:
       - name: Get last Docker image build time
         id: get_last_build
         run: |
-          # Query Docker Hub for the last image with our specific tag pattern
           IMAGE_NAME_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
           PREFIX="${{ env.BUILD_TAG_PREFIX }}"
-
           echo "Querying Docker Hub for last $PREFIX build..."
-
-          # Get all tags for the Docker Hub repository
           RESPONSE=$(curl -s "https://hub.docker.com/v2/repositories/${IMAGE_NAME_LOWER}/tags?page_size=100" || echo '{"results":[]}')
-
-          # Check if the repository exists and has tags
+          
           if [ "$(echo "$RESPONSE" | jq -r '.results | length')" = "0" ]; then
             echo "No previous Docker images found. This will be the first build."
             echo "commits_since_last=999" >> $GITHUB_OUTPUT
             echo "last_build_time=never" >> $GITHUB_OUTPUT
             echo "last_build_tag=none" >> $GITHUB_OUTPUT
           else
-            # Get the most recent tag matching our pattern (format: PREFIX-YYYYMMDD-HHmmss)
             LAST_BUILD_TAG=$(echo "$RESPONSE" | jq -r '.results[].name' | grep -E "^${PREFIX}-[0-9]{8}-[0-9]{6}$" | sort -r | head -n 1)
-            
             if [ -z "$LAST_BUILD_TAG" ]; then
               echo "No $PREFIX timestamp tags found. This will be the first tracked build."
               echo "commits_since_last=999" >> $GITHUB_OUTPUT
@@ -60,16 +53,9 @@ jobs:
               echo "last_build_tag=none" >> $GITHUB_OUTPUT
             else
               echo "Last build tag: $LAST_BUILD_TAG"
-              
-              # Extract timestamp from tag (remove prefix)
               LAST_BUILD_TIME=$(echo "$LAST_BUILD_TAG" | sed "s/^${PREFIX}-//")
-              
-              # Convert timestamp to a date format git understands (YYYY-MM-DD HH:MM:SS)
               BUILD_DATE=$(echo "$LAST_BUILD_TIME" | sed -E 's/([0-9]{4})([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})([0-9]{2})/\1-\2-\3 \4:\5:\6/')
-              
-              # Count commits since that timestamp
               COMMITS_SINCE=$(git rev-list --count --since="$BUILD_DATE" HEAD)
-              
               echo "Commits since last build ($BUILD_DATE): $COMMITS_SINCE"
               echo "commits_since_last=$COMMITS_SINCE" >> $GITHUB_OUTPUT
               echo "last_build_time=$LAST_BUILD_TIME" >> $GITHUB_OUTPUT
@@ -82,7 +68,6 @@ jobs:
         run: |
           COMMITS=${{ steps.get_last_build.outputs.commits_since_last }}
           FORCE=${{ github.event.inputs.force_build }}
-
           if [ "$FORCE" = "true" ]; then
             echo "Force build requested"
             echo "build=true" >> $GITHUB_OUTPUT
@@ -144,7 +129,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64 # Build only amd64 for speed (remove arm64)
+          platforms: linux/amd64
           cache-from: |
             type=registry,ref=${{ env.REGISTRY }}/${{ steps.lowercase.outputs.image_name }}:${{ env.BUILD_TAG_PREFIX }}-buildcache
             type=gha
@@ -166,15 +151,30 @@ jobs:
           echo "Triggering Render deploy hook..."
           curl -fsS -X POST "$DEPLOY_HOOK"
 
-      - name: Wait for deployment
+      - name: Wait for Render deployment to complete
         if: steps.should_build.outputs.build == 'true'
-        uses: bounceapp/render-action@0.12.0
-        with:
-          render-token: ${{ secrets.RENDER_API_KEY }}
-          service-id: ${{ secrets.RENDER_SERVICE_ID }}
-          retries: 20
-          wait: 30000
-          sleep: 60000
+        env:
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          echo "Waiting for deployment to go live..."
+          for i in {1..20}; do
+            STATUS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys?limit=1" \
+              | jq -r '.[0].deploy.status')
+            echo "Current status: $STATUS"
+            if [ "$STATUS" = "live" ]; then
+              echo "Deployment is live!"
+              exit 0
+            elif [ "$STATUS" = "update_failed" ]; then
+              echo "Deployment failed!"
+              exit 1
+            fi
+            echo "Not live yet, sleeping 30s..."
+            sleep 30
+          done
+          echo "Deployment did not become live after waiting."
+          exit 1
 
       - name: Build summary
         if: steps.should_build.outputs.build == 'true'
