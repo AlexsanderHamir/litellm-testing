@@ -18,6 +18,13 @@ env:
   COMMIT_THRESHOLD: 1
   BUILD_TAG_PREFIX: render
 
+  PERF_DOCKERHUB_USERNAME: ${{ secrets.PERF_DOCKERHUB_USERNAME }}
+  PERF_DOCKERHUB_TOKEN: ${{ secrets.PERF_DOCKERHUB_TOKEN }}
+  PERF_RENDER_DEPLOY_HOOK: ${{ secrets.PERF_RENDER_DEPLOY_HOOK }}
+  PERF_RENDER_SERVICE_ID: ${{ secrets.PERF_RENDER_SERVICE_ID }}
+  PERF_RENDER_API_KEY: ${{ secrets.PERF_RENDER_API_KEY }}
+  PERF_RENDER_LOAD_GENERATOR_SERVICE_ID: ${{ secrets.PERF_RENDER_LOAD_GENERATOR_SERVICE_ID }}
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -38,7 +45,7 @@ jobs:
           PREFIX="${{ env.BUILD_TAG_PREFIX }}"
           echo "Querying Docker Hub for last $PREFIX build..."
           RESPONSE=$(curl -s "https://hub.docker.com/v2/repositories/${IMAGE_NAME_LOWER}/tags?page_size=100" || echo '{"results":[]}')
-          
+
           if [ "$(echo "$RESPONSE" | jq -r '.results | length')" = "0" ]; then
             echo "No previous Docker images found. This will be the first build."
             echo "commits_since_last=999" >> $GITHUB_OUTPUT
@@ -80,7 +87,6 @@ jobs:
             echo "Not enough commits: $COMMITS/${{ env.COMMIT_THRESHOLD }}"
             echo "build=false" >> $GITHUB_OUTPUT
             echo "reason=Only $COMMITS commits since last build (threshold: ${{ env.COMMIT_THRESHOLD }})" >> $GITHUB_OUTPUT
-          fi
 
       - name: Display build decision
         run: |
@@ -101,8 +107,8 @@ jobs:
         if: steps.should_build.outputs.build == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.PERF_DOCKERHUB_USERNAME }}
+          password: ${{ env.PERF_DOCKERHUB_TOKEN }}
 
       - name: Lowercase image name
         if: steps.should_build.outputs.build == 'true'
@@ -141,26 +147,21 @@ jobs:
 
       - name: Trigger Render deploy
         if: steps.should_build.outputs.build == 'true'
-        env:
-          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
         run: |
-          if [ -z "$DEPLOY_HOOK" ]; then
-            echo "RENDER_DEPLOY_HOOK secret not set; skipping deploy trigger."
+          if [ -z "${{ env.PERF_RENDER_DEPLOY_HOOK }}" ]; then
+            echo "PERF_RENDER_DEPLOY_HOOK secret not set; skipping deploy trigger."
             exit 0
           fi
           echo "Triggering Render deploy hook..."
-          curl -fsS -X POST "$DEPLOY_HOOK"
+          curl -fsS -X POST "${{ env.PERF_RENDER_DEPLOY_HOOK }}"
 
       - name: Wait for Render deployment to complete
         if: steps.should_build.outputs.build == 'true'
-        env:
-          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
-          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
         run: |
           echo "Waiting for deployment to go live..."
           for i in {1..20}; do
-            STATUS=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" \
-              "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys?limit=1" \
+            STATUS=$(curl -s -H "Authorization: Bearer ${{ env.PERF_RENDER_API_KEY }}" \
+              "https://api.render.com/v1/services/${{ env.PERF_RENDER_SERVICE_ID }}/deploys?limit=1" \
               | jq -r '.[0].deploy.status')
             echo "Current status: $STATUS"
             if [ "$STATUS" = "live" ]; then
@@ -175,6 +176,14 @@ jobs:
           done
           echo "Deployment did not become live after waiting."
           exit 1
+
+      - name: Resume load generator
+        if: steps.should_build.outputs.build == 'true'
+        run: |
+          echo "Resuming load generator service..."
+          curl -X POST "https://api.render.com/v1/services/${{ env.PERF_RENDER_LOAD_GENERATOR_SERVICE_ID }}/resume" \
+            -H "Authorization: Bearer ${{ env.PERF_RENDER_API_KEY }}" \
+            -H "Content-Type: application/json"
 
       - name: Build summary
         if: steps.should_build.outputs.build == 'true'
